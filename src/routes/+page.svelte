@@ -1,13 +1,14 @@
 <script lang="ts">
   import { onMount } from 'svelte'
+  import { get } from 'svelte/store'
   import Button from 'flowbite-svelte/Button.svelte'
   import {
-    acknowledgeReminder, addAnnouncement, addSession, addSpeaker, addTerm, canRedo, canUndo, clearDuplicate,
-    deleteCue, desk, getDelay, ingestCue, moveCue, publishAnnouncement, redoDesk, sendReminder, setActiveCue,
-    setCueStatus, setFontScale, setLiveSimulation, setOnline, speakerName, termTarget, undoDesk, updateCue,
-    updateSession, updateSpeaker, updateTerm
+    acknowledgeReminder, addAnnouncement, addSession, addSpeaker, addTerm, applyLineCorrection, canRedo, canUndo, clearDuplicate,
+    deleteCue, desk, getDelay, ingestCue, markLineSendFailed, moveCue, publishAnnouncement, reconcileScreen, redoDesk, retryLineSend,
+    sendReminder, setActiveCue, setCueStatus, setFontScale, setLiveSimulation, setOnline, speakerName, termTarget, toggleLineScreen,
+    undoDesk, updateCue, updateSession, updateSpeaker, updateTerm
   } from '$lib/store'
-  import type { Announcement, Cue, Session, TabId, Term } from '$lib/types'
+  import type { Announcement, Cue, CueSource, Session, TabId, Term } from '$lib/types'
 
   const liveLines = [
     'Cooling corridors can connect parks, schools, and shaded transit stops.',
@@ -39,6 +40,35 @@
   $: activeSpeaker = $desk.speakers.find(item => item.id === activeCue?.speakerId)
   $: activeTerms = $desk.terms.filter(item => item.speakerId === activeCue?.speakerId || activeCue?.tags.includes(item.target))
   $: unreadReminders = $desk.reminders.filter(item => !item.acknowledged)
+  $: heldCount = $desk.cues.filter(item => item.heldForSupervisor).length
+  $: failedLineCount = $desk.cues.filter(item => item.source === 'line' && item.sendFailed).length
+  $: reconciledCount = $desk.cues.filter(item => item.reconciled).length
+
+  function sourceLabel(source: CueSource): string {
+    return ({ line: '线路', interpreter: '口译位', legacy: '旧条目' })[source]
+  }
+  function sourceClass(source: CueSource): string {
+    return source === 'line' ? 'bg-sky-100 text-sky-800' : source === 'interpreter' ? 'bg-teal-100 text-teal-800' : 'bg-slate-200 text-slate-600'
+  }
+  function runReconcile() {
+    reconcileScreen()
+    const held = get(desk).cues.filter(item => item.heldForSupervisor).length
+    if (held) flash(`对账完成：${held} 段对不上，已留出等值班主管定。`)
+    else flash('对账完成：两边已上屏段号一致。')
+  }
+  function retryFailedLines() {
+    retryLineSend()
+    flash('线路侧已按序号重试发送，口译位记录不受影响。')
+  }
+  function applyCorrectionForActive() {
+    if (!activeCue) return
+    const text = window.prompt(`线路更正 · 序号 ${activeCue.sequence}（仅回填未确认段落）`, activeCue.text)
+    if (text === null) return
+    const result = applyLineCorrection(activeCue.sequence, text)
+    if (result === 'backfilled') flash('线路更正已回填到未确认段落。')
+    else if (result === 'skipped') flash('该段落已确认，线路更正照旧不回填。')
+    else flash('未找到对应线路段落。')
+  }
 
   onMount(() => {
     if (typeof navigator !== 'undefined') setOnline(navigator.onLine)
@@ -178,11 +208,21 @@
           <h1 class="mt-1 text-2xl font-black tracking-tight lg:text-4xl">{currentSession?.title}</h1>
           <p class="mt-2 text-sm text-slate-500">{currentSession?.time} · {currentSession?.room} · {$desk.speakers.find(item => item.id === currentSession?.speakerId)?.name}</p>
         </div>
-        <div class="grid grid-cols-3 gap-2 text-center">
+        <div class="grid grid-cols-3 gap-2 text-center sm:grid-cols-5">
           <div class="rounded-xl border bg-white px-4 py-2"><strong class="block text-xl">{pendingCount}</strong><span class="text-[10px] text-slate-500">待传</span></div>
           <div class="rounded-xl border bg-white px-4 py-2"><strong class="block text-xl text-amber-700">{lateCount}</strong><span class="text-[10px] text-slate-500">偏高延迟</span></div>
           <div class="rounded-xl border bg-white px-4 py-2"><strong class="block text-xl text-red-700">{duplicateCount}</strong><span class="text-[10px] text-slate-500">疑似重复</span></div>
+          <div class="rounded-xl border bg-white px-4 py-2"><strong class="block text-xl text-indigo-700">{reconciledCount}</strong><span class="text-[10px] text-slate-500">已对账</span></div>
+          <div class="rounded-xl border bg-white px-4 py-2"><strong class="block text-xl text-red-700">{heldCount}</strong><span class="text-[10px] text-slate-500">留出等主管</span></div>
         </div>
+      </div>
+
+      <div class="mb-4 flex flex-wrap items-center gap-2 rounded-xl border border-slate-200 bg-white px-4 py-3 text-xs">
+        <strong class="text-slate-700">收工对账：</strong>
+        <span class="text-slate-500">线路与口译位两边已上屏段号按序号比对，对不上的留出等值班主管定。</span>
+        <Button size="xs" color="green" on:click={runReconcile}>收工对账</Button>
+        <Button size="xs" color="yellow" disabled={!failedLineCount} on:click={retryFailedLines}>线路侧重试{#if failedLineCount}（{failedLineCount}）{/if}</Button>
+        <span class="ml-auto text-slate-400">旧条目打开时已补来源标记再启用</span>
       </div>
 
       <div class="grid gap-4 xl:grid-cols-[minmax(0,1.65fr)_minmax(300px,.75fr)]">
@@ -221,9 +261,16 @@
                     <span class="grid h-8 w-8 shrink-0 place-items-center rounded-lg bg-slate-900 text-xs font-black text-white">{index + 1}</span>
                     <div class="min-w-0 flex-1">
                       <div class="mb-2 flex flex-wrap items-center gap-2 text-[10px] font-bold">
+                        <span class="rounded-md bg-slate-900 px-2 py-1 text-white">序号 {cue.sequence}</span>
+                        <span class="rounded-md px-2 py-1 {sourceClass(cue.source)}">{sourceLabel(cue.source)}{#if cue.source === 'legacy' && cue.sourceMarked} · 已补标记{/if}</span>
                         <span class="rounded-md bg-slate-100 px-2 py-1 text-slate-600">{speakerName($desk, cue.speakerId)}</span>
                         <span class="rounded-md border px-2 py-1 {delayClass(getDelay(cue, now))}">{formatTime(cue.receivedAt)} · 延迟 {getDelay(cue, now)}s</span>
                         <span class="rounded-md px-2 py-1 {cue.status === 'confirmed' ? 'bg-emerald-100 text-emerald-800' : cue.status === 'followup' ? 'bg-amber-100 text-amber-900' : 'bg-blue-100 text-blue-800'}">{statusLabel(cue.status)}</span>
+                        {#if cue.onScreen}<span class="rounded-md bg-indigo-100 px-2 py-1 text-indigo-800">已上屏</span>{/if}
+                        {#if cue.reconciled}<span class="rounded-md bg-emerald-100 px-2 py-1 text-emerald-800">已对账</span>{/if}
+                        {#if cue.heldForSupervisor}<span class="rounded-md bg-red-100 px-2 py-1 text-red-800">留出等主管</span>{/if}
+                        {#if cue.lineCorrected}<span class="rounded-md bg-cyan-100 px-2 py-1 text-cyan-800">线路已更正</span>{/if}
+                        {#if cue.sendFailed}<span class="rounded-md bg-red-100 px-2 py-1 text-red-800">线路发送失败{#if cue.retryCount} · 重试 {cue.retryCount} 次{/if}</span>{/if}
                         {#if cue.offline}<span class="rounded-md bg-amber-100 px-2 py-1 text-amber-900">离线暂存</span>{/if}
                         {#if cue.manual}<span class="rounded-md bg-slate-100 px-2 py-1 text-slate-600">手工</span>{/if}
                       </div>
@@ -236,6 +283,16 @@
                       {/if}
                       {#if cue.followupText}<p class="mt-2 rounded-lg bg-amber-50 px-3 py-2 text-xs text-amber-900"><strong>补译：</strong>{cue.followupText}</p>{/if}
                       <div class="mt-2 flex flex-wrap gap-1">{#each cue.tags as tag}<span class="rounded-full bg-teal-100 px-2 py-1 text-[10px] font-bold text-teal-800">{tag}</span>{/each}</div>
+                      {#if cue.heldForSupervisor}
+                        <div class="mt-2 rounded-lg border border-red-300 bg-red-50 px-3 py-2 text-xs text-red-800"><strong>对账对不上：</strong>两边已上屏段号不一致，已留出等值班主管定。</div>
+                      {/if}
+                      {#if cue.source === 'line'}
+                        <div class="mt-2 flex flex-wrap gap-2 text-[10px] font-bold">
+                          <button class="rounded-md border border-sky-300 bg-sky-50 px-2 py-1 text-sky-800" on:click|stopPropagation={() => toggleLineScreen(cue.id)}>{cue.onScreen ? '撤下线路上屏' : '线路上屏'}</button>
+                          <button class="rounded-md border border-cyan-300 bg-cyan-50 px-2 py-1 text-cyan-800" on:click|stopPropagation={() => { const t = window.prompt(`线路更正 · 序号 ${cue.sequence}`, cue.text); if (t !== null) { const r = applyLineCorrection(cue.sequence, t); flash(r === 'backfilled' ? '线路更正已回填。' : r === 'skipped' ? '已确认段落照旧，不回填。' : '未找到线路段落。') } }}>线路更正</button>
+                          <button class="rounded-md border border-red-300 bg-red-50 px-2 py-1 text-red-800" on:click|stopPropagation={() => markLineSendFailed(cue.id)}>标记发送失败</button>
+                        </div>
+                      {/if}
                     </div>
                   </div>
                 </article>
@@ -251,8 +308,20 @@
               <div class="flex gap-1"><button class="focus-ring rounded-lg border px-2 py-1 text-xs" aria-label="上一条" on:click={() => moveCue(-1)}>↑</button><button class="focus-ring rounded-lg border px-2 py-1 text-xs" aria-label="下一条" on:click={() => moveCue(1)}>↓</button></div>
             </div>
             {#if activeCue}
-              <div class="rounded-xl bg-slate-50 p-3"><p class="text-sm leading-6">{activeCue.text}</p><p class="mt-2 text-[10px] text-slate-500">快捷键：J / K 移动，C 确认，T 发送首条高优先术语提醒</p></div>
+              <div class="rounded-xl bg-slate-50 p-3">
+                <div class="mb-2 flex flex-wrap items-center gap-2 text-[10px] font-bold">
+                  <span class="rounded-md bg-slate-900 px-2 py-1 text-white">序号 {activeCue.sequence}</span>
+                  <span class="rounded-md px-2 py-1 {sourceClass(activeCue.source)}">{sourceLabel(activeCue.source)}</span>
+                  {#if activeCue.onScreen}<span class="rounded-md bg-indigo-100 px-2 py-1 text-indigo-800">已上屏</span>{/if}
+                  {#if activeCue.heldForSupervisor}<span class="rounded-md bg-red-100 px-2 py-1 text-red-800">留出等主管</span>{/if}
+                </div>
+                <p class="text-sm leading-6">{activeCue.text}</p>
+                <p class="mt-2 text-[10px] text-slate-500">快捷键：J / K 移动，C 确认，T 发送首条高优先术语提醒</p>
+              </div>
               <div class="mt-3 grid grid-cols-2 gap-2"><Button color="green" on:click={confirmActive}>确认已传 <kbd class="ml-1 text-[10px]">C</kbd></Button><Button color="yellow" on:click={() => tab = 'offline'}>手工补充</Button></div>
+              {#if activeCue.source === 'line'}
+                <Button class="mt-2 w-full" color="light" on:click={applyCorrectionForActive}>线路更正（仅回填未确认段落）</Button>
+              {/if}
               <label for="followup-input" class="mt-4 block text-[10px] font-black uppercase tracking-wider text-slate-500">遗漏补译</label>
               <textarea id="followup-input" class="focus-ring mt-2 w-full rounded-xl border p-3 text-sm" rows="3" bind:value={followup} placeholder="输入遗漏内容或修正术语…"></textarea>
               <Button class="mt-2 w-full" color="light" disabled={!followup.trim()} on:click={saveFollowup}>标记补充完成</Button>
@@ -356,14 +425,14 @@
           <label class="text-xs font-bold">发言人或场次<select class="focus-ring mt-2 w-full rounded-xl border p-3" bind:value={manualSpeakerId}><option value="">跟随当前发言人</option>{#each $desk.speakers as speaker}<option value={speaker.id}>{speaker.name}</option>{/each}</select></label>
           <label class="mt-4 block text-xs font-bold">现场文字<textarea bind:this={manualInput} class="focus-ring mt-2 w-full rounded-xl border p-4 text-base leading-7" rows="8" bind:value={manualText} placeholder="网络中断时，在这里继续录入…" on:keydown={event => { if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') submitManual() }}></textarea></label>
           <Button class="mt-3 w-full" size="lg" disabled={!manualText.trim()} on:click={submitManual}>加入队列</Button>
-          <div class="mt-4 rounded-xl bg-amber-50 p-3 text-xs text-amber-900"><strong>暂存规则：</strong>离线条目会带“本地”标记；恢复连接后自动与本机队列合并，并执行相似内容检测。</div>
+          <div class="mt-4 rounded-xl bg-amber-50 p-3 text-xs text-amber-900"><strong>暂存规则：</strong>断网时口译位照旧记录、带“口译位”标记；恢复后按序号补送合并。线路侧恢复失败后按序号重试，口译位那份不受影响。</div>
         </section>
         <section class="rounded-2xl border bg-white p-5 shadow-sm">
           <div class="mb-4 flex flex-wrap items-center justify-between gap-3"><div><h2 class="font-black">合并与冲突检查</h2><p class="text-xs text-slate-500">当前有 {offlineCount} 条离线条目，{duplicateCount} 条疑似重复。</p></div><Button disabled={$desk.online || !offlineCount} color="green" on:click={mergeOffline}>恢复连接并合并</Button></div>
           <div class="space-y-3">
             {#each $desk.cues.filter(item => item.offline) as cue}
               <article class="rounded-xl border border-dashed border-amber-300 bg-amber-50/60 p-4">
-                <div class="flex items-center justify-between text-[10px] font-bold text-amber-800"><span>本机暂存 · {formatTime(cue.receivedAt)}</span><span>{speakerName($desk, cue.speakerId)}</span></div>
+                <div class="flex items-center justify-between text-[10px] font-bold text-amber-800"><span>本机暂存 · 序号 {cue.sequence} · {sourceLabel(cue.source)} · {formatTime(cue.receivedAt)}</span><span>{speakerName($desk, cue.speakerId)}</span></div>
                 <textarea class="focus-ring mt-3 w-full rounded-xl border border-amber-200 bg-white p-3 text-sm" rows="3" value={cue.text} on:change={event => updateCue(cue.id, { text: (event.target as HTMLTextAreaElement).value })}></textarea>
                 <div class="mt-2 flex justify-between"><span class="text-[10px] text-amber-800">等待恢复网络后进入现场队列</span><button class="text-xs font-bold text-red-700 underline" on:click={() => deleteCue(cue.id)}>删除暂存</button></div>
               </article>
