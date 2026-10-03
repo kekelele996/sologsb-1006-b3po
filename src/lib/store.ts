@@ -1,5 +1,8 @@
 import { writable, get } from 'svelte/store'
-import type { Announcement, Cue, CueStatus, DeskState, Reminder, Session, Speaker, Term } from './types'
+import type {
+  Announcement, Cue, CueStatus, CueSource, DeliveryState, DeskState,
+  ReconcileState, Reminder, Session, Speaker, Term
+} from './types'
 
 const STORAGE_KEY = 'conference-cue-desk-v1'
 const speakers: Speaker[] = [
@@ -21,15 +24,54 @@ const terms: Term[] = [
   { id: 'term-4', source: 'distributed energy resource', target: '分布式能源资源', note: '缩写 DER', speakerId: 'sp-4', priority: 'high' },
   { id: 'term-5', source: 'health equity', target: '健康公平', note: '不译为健康平等', speakerId: 'sp-3', priority: 'high' }
 ]
+
+interface SeedCue {
+  seq: number
+  text: string
+  ago: number
+  status: CueStatus
+  delay: number
+  followup?: string
+  tags: string[]
+  lineOnScreen: boolean
+  deskOnScreen: boolean
+  reconcile?: ReconcileState
+}
+const seedCues: SeedCue[] = [
+  { seq: 101, text: 'The urban heat island effect is not evenly distributed across a city.', ago: 36000, status: 'confirmed', delay: 4, tags: ['城市热岛'], lineOnScreen: true, deskOnScreen: true },
+  { seq: 102, text: 'Neighborhoods with less tree canopy can be several degrees warmer at night.', ago: 19000, status: 'confirmed', delay: 6, followup: '补译：“夜间温差可达数摄氏度。”', tags: ['树冠覆盖率'], lineOnScreen: true, deskOnScreen: false, reconcile: 'held' },
+  { seq: 103, text: 'Our resilience strategy links cooling corridors with public health investments.', ago: 9000, status: 'pending', delay: 11, tags: ['韧性', '协同效益'], lineOnScreen: false, deskOnScreen: false },
+  { seq: 104, text: 'That data also reveals health equity gaps between districts.', ago: 2500, status: 'pending', delay: 4, tags: ['健康公平'], lineOnScreen: false, deskOnScreen: false }
+]
+
 function initialCues(): Cue[] {
   const now = Date.now()
-  return [
-    { id: 'cue-101', speakerId: 'sp-1', text: 'The urban heat island effect is not evenly distributed across a city.', receivedAt: now - 36000, status: 'confirmed', manual: false, offline: false, delaySeconds: 4, duplicateOf: null, followupText: '', tags: ['城市热岛'] },
-    { id: 'cue-102', speakerId: 'sp-1', text: 'Neighborhoods with less tree canopy can be several degrees warmer at night.', receivedAt: now - 19000, status: 'confirmed', manual: false, offline: false, delaySeconds: 6, duplicateOf: null, followupText: '补译：“夜间温差可达数摄氏度。”', tags: ['树冠覆盖率'] },
-    { id: 'cue-103', speakerId: 'sp-1', text: 'Our resilience strategy links cooling corridors with public health investments.', receivedAt: now - 9000, status: 'pending', manual: false, offline: false, delaySeconds: 11, duplicateOf: null, followupText: '', tags: ['韧性', '协同效益'] },
-    { id: 'cue-104', speakerId: 'sp-1', text: 'That data also reveals health equity gaps between districts.', receivedAt: now - 2500, status: 'pending', manual: false, offline: false, delaySeconds: 4, duplicateOf: null, followupText: '', tags: ['健康公平'] }
-  ]
+  return seedCues.map(row => ({
+    id: `cue-${row.seq}`,
+    seq: row.seq,
+    source: 'line' as CueSource,
+    enabled: true,
+    legacy: false,
+    speakerId: 'sp-1',
+    text: row.text,
+    receivedAt: now - row.ago,
+    status: row.status,
+    manual: false,
+    offline: false,
+    delivery: 'live' as DeliveryState,
+    delaySeconds: row.delay,
+    duplicateOf: null,
+    followupText: row.followup || '',
+    tags: row.tags,
+    corrected: false,
+    lineOnScreen: row.lineOnScreen,
+    deskOnScreen: row.deskOnScreen,
+    reconcile: row.reconcile || 'none',
+    resolveNote: '',
+    retryCount: 0
+  }))
 }
+
 function demoState(): DeskState {
   return {
     speakers, sessions, terms, cues: initialCues(), reminders: [], activeCueId: 'cue-103', fontScale: 100,
@@ -37,17 +79,57 @@ function demoState(): DeskState {
       { id: 'ann-1', level: 'info', text: '十点整有消防联动测试，请提醒会场人员保持镇定。', visibleOnStage: false, createdAt: new Date().toISOString() },
       { id: 'ann-2', level: 'urgent', text: '请下一位发言人提前到侧台候场。', visibleOnStage: false, createdAt: new Date().toISOString() }
     ],
-    online: true, liveSimulation: true, updatedAt: new Date().toISOString()
+    online: true, lineConnected: true, lineRecoveryFailed: false,
+    liveSimulation: true, nextSeq: 105, legacyImported: 0,
+    updatedAt: new Date().toISOString()
   }
 }
+
 function clone<T>(value: T): T { return structuredClone(value) }
+
+/**
+ * 旧条目没记来源的，打开时补上来源标记再启用。
+ * 老版本存储里没有 seq/source/双份上屏等字段，这里统一补齐。
+ */
+function migrate(state: DeskState): DeskState {
+  let legacyImported = 0
+  let maxSeq = 100
+  state.cues.forEach(cue => {
+    if (cue.seq === undefined || cue.source === undefined) {
+      cue.legacy = true
+      legacyImported++
+    }
+    if (cue.source === undefined) cue.source = 'line'
+    if (cue.enabled === undefined) cue.enabled = true
+    if (cue.legacy === undefined) cue.legacy = false
+    if (cue.delivery === undefined) cue.delivery = cue.offline ? 'deskQueued' : 'live'
+    if (cue.corrected === undefined) cue.corrected = false
+    if (cue.lineOnScreen === undefined) cue.lineOnScreen = cue.status === 'confirmed'
+    if (cue.deskOnScreen === undefined) cue.deskOnScreen = cue.status === 'confirmed'
+    if (cue.reconcile === undefined) cue.reconcile = 'none'
+    if (cue.resolveNote === undefined) cue.resolveNote = ''
+    if (cue.retryCount === undefined) cue.retryCount = 0
+    if (typeof cue.seq !== 'number') cue.seq = ++maxSeq
+    maxSeq = Math.max(maxSeq, cue.seq)
+  })
+  if (state.nextSeq === undefined) state.nextSeq = maxSeq + 1
+  if (state.lineConnected === undefined) state.lineConnected = true
+  if (state.lineRecoveryFailed === undefined) state.lineRecoveryFailed = false
+  if (state.legacyImported === undefined) state.legacyImported = legacyImported
+  else if (legacyImported) state.legacyImported += legacyImported
+  return state
+}
+
 function loadState(): DeskState {
   if (typeof localStorage === 'undefined') return demoState()
   try {
     const saved = localStorage.getItem(STORAGE_KEY)
-    return saved ? { ...demoState(), ...JSON.parse(saved), online: navigator.onLine } : demoState()
+    if (!saved) return demoState()
+    const merged = { ...demoState(), ...JSON.parse(saved), online: navigator.onLine }
+    return migrate(merged)
   } catch { return demoState() }
 }
+
 const history: DeskState[] = []
 const future: DeskState[] = []
 export const desk = writable<DeskState>(loadState())
@@ -97,50 +179,261 @@ export function addAnnouncement(text: string, level: Announcement['level']) {
 }
 export function publishAnnouncement(id: string, visible: boolean) { commit(state => { const item = state.announcements.find(row => row.id === id); if (item) item.visibleOnStage = visible }) }
 
+/* ---------------- 网络：口译位与转写线路各走各的 ---------------- */
+
+/** 口译位侧网络（浏览器 online/offline 事件也走这里） */
 export function setOnline(online: boolean) {
+  commit(state => { state.online = online })
+}
+
+/** 转写线路断连：线路的账开始排队，口译位那份不受影响 */
+export function setLineDisconnected() {
   commit(state => {
-    state.online = online
-    if (online) {
-      state.cues.forEach(cue => {
-        if (cue.offline) {
-          cue.offline = false
-          const duplicate = findDuplicate(cue.text, state.cues.filter(item => item.id !== cue.id && !item.offline))
-          cue.duplicateOf = duplicate?.id || null
-        }
-      })
+    state.lineConnected = false
+    state.lineRecoveryFailed = false
+  })
+}
+
+/**
+ * 转写线路恢复：恢复成功，线路待重试条目按序号顺序补送；
+ * 恢复失败则标记失败、保持待重试，口译位记录完全不动。
+ */
+export function recoverLine(success: boolean) {
+  commit(state => {
+    if (success) {
+      state.lineConnected = true
+      state.lineRecoveryFailed = false
+      state.cues
+        .filter(cue => cue.delivery === 'lineQueued' || cue.delivery === 'lineRetry')
+        .sort((a, b) => a.seq - b.seq)
+        .forEach(cue => {
+          cue.delivery = 'live'
+          cue.retryCount = 0
+        })
+    } else {
+      state.lineConnected = false
+      state.lineRecoveryFailed = true
+      state.cues
+        .filter(cue => cue.delivery === 'lineQueued')
+        .sort((a, b) => a.seq - b.seq)
+        .forEach(cue => { cue.delivery = 'lineRetry' })
     }
   })
 }
+
+/** 线路侧“恢复失败后按序号重试”：只动线路那份，逐条重试，仍失败则保留 */
+export function retryLineBySeq(perTrySucceeds: boolean): { done: number; remaining: number } {
+  let done = 0, remaining = 0
+  commit(state => {
+    const queued = state.cues
+      .filter(cue => cue.delivery === 'lineRetry' || cue.delivery === 'lineQueued')
+      .sort((a, b) => a.seq - b.seq)
+    queued.forEach(cue => {
+      cue.retryCount += 1
+      if (perTrySucceeds) {
+        cue.delivery = 'live'
+        cue.retryCount = 0
+        done++
+      } else {
+        cue.delivery = 'lineRetry'
+        remaining++
+      }
+    })
+  })
+  return { done, remaining }
+}
+
+/**
+ * 口译位网络恢复：照旧记下的内容按序号补送，合并时重新做重复检查。
+ * 不影响线路侧任何状态。
+ */
+export function recoverDesk(): { resent: number } {
+  let resent = 0
+  commit(state => {
+    state.online = true
+    state.cues
+      .filter(cue => cue.delivery === 'deskQueued')
+      .sort((a, b) => a.seq - b.seq)
+      .forEach(cue => {
+        const duplicate = findDuplicate(cue.text, state.cues.filter(item => item.id !== cue.id && item.delivery === 'live'))
+        cue.duplicateOf = duplicate?.id || null
+        cue.offline = false
+        cue.delivery = 'live'
+        resent++
+      })
+  })
+  return { resent }
+}
+
+export function dismissLegacyNotice() { commit(state => { state.legacyImported = 0 }) }
+
 export function setLiveSimulation(enabled: boolean) { commit(state => { state.liveSimulation = enabled }) }
 export function setActiveCue(id: string) { commit(state => { state.activeCueId = id }) }
 export function moveCue(direction: 1 | -1) {
   const state = get(desk)
-  const index = state.cues.findIndex(item => item.id === state.activeCueId)
-  const next = state.cues[index + direction]
+  const visible = state.cues.filter(item => item.enabled)
+  const index = visible.findIndex(item => item.id === state.activeCueId)
+  const next = visible[index + direction]
   if (next) setActiveCue(next.id)
 }
 export function setFontScale(scale: number) { commit(state => { state.fontScale = Math.min(150, Math.max(85, scale)) }) }
 
-export function ingestCue(text: string, options: { manual?: boolean; speakerId?: string; receivedAt?: number } = {}) {
+/**
+ * 记账：
+ * - source 'line'：转写线路推送，带推送序号和原话；线路断连时排队/待重试。
+ * - source 'desk'：口译位手工录入；口译位断网时本机照记，恢复后按序号补送。
+ */
+export function ingestCue(text: string, options: { manual?: boolean; speakerId?: string; receivedAt?: number; source?: CueSource } = {}) {
   const trimmed = text.trim()
   if (!trimmed) return
   commit(state => {
-    const existing = state.cues.filter(item => item.text !== trimmed)
+    const source: CueSource = options.source || 'line'
+    const existing = state.cues.filter(item => item.enabled && item.text !== trimmed && item.delivery === 'live')
     const duplicate = findDuplicate(trimmed, existing)
     const speakerId = options.speakerId || state.sessions.find(item => item.status === 'live')?.speakerId || state.speakers[0]?.id || ''
     const receivedAt = options.receivedAt || Date.now()
+    const seq = state.nextSeq++
+    let delivery: DeliveryState = 'live'
+    if (source === 'desk' && !state.online) delivery = 'deskQueued'
+    if (source === 'line' && !state.lineConnected) delivery = state.lineRecoveryFailed ? 'lineRetry' : 'lineQueued'
     const cue: Cue = {
-      id: `cue-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`, speakerId, text: trimmed, receivedAt,
-      status: 'pending', manual: Boolean(options.manual), offline: !state.online, delaySeconds: Math.max(0, Math.round((Date.now() - receivedAt) / 1000)),
-      duplicateOf: duplicate?.id || null, followupText: '', tags: detectTerms(trimmed, state.terms)
+      id: `cue-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+      seq, source, enabled: true, legacy: false,
+      speakerId, text: trimmed, receivedAt,
+      status: 'pending', manual: source === 'desk' || Boolean(options.manual),
+      offline: source === 'desk' && !state.online,
+      delivery,
+      delaySeconds: Math.max(0, Math.round((Date.now() - receivedAt) / 1000)),
+      duplicateOf: duplicate?.id || null, followupText: '', tags: detectTerms(trimmed, state.terms),
+      corrected: false,
+      // 初进队列两边都还没上屏；确认的口译位侧才挂自己的上屏号
+      lineOnScreen: false, deskOnScreen: false,
+      reconcile: 'none', resolveNote: '', retryCount: 0
     }
     state.cues.push(cue); state.activeCueId = cue.id
   })
 }
+
 export function updateCue(id: string, patch: Partial<Cue>) { commit(state => { const cue = state.cues.find(item => item.id === id); if (cue) Object.assign(cue, patch) }) }
-export function setCueStatus(id: string, status: CueStatus) { commit(state => { const cue = state.cues.find(item => item.id === id); if (cue) cue.status = status }) }
-export function deleteCue(id: string) { commit(state => { state.cues = state.cues.filter(item => item.id !== id); if (state.activeCueId === id) state.activeCueId = state.cues.at(-1)?.id || '' }) }
+
+/**
+ * 口译位确认：口译位侧管确认结果，并把该段号挂到口译位的“已上屏”账上。
+ * 确认过的段不再被线路更正回填。
+ */
+export function setCueStatus(id: string, status: CueStatus) {
+  commit(state => {
+    const cue = state.cues.find(item => item.id === id)
+    if (!cue) return
+    cue.status = status
+    if (status === 'confirmed') cue.deskOnScreen = true
+  })
+}
+export function deleteCue(id: string) {
+  commit(state => {
+    state.cues = state.cues.filter(item => item.id !== id)
+    if (state.activeCueId === id) state.activeCueId = state.cues.filter(item => item.enabled).at(-1)?.id || ''
+  })
+}
 export function clearDuplicate(id: string) { commit(state => { const cue = state.cues.find(item => item.id === id); if (cue) cue.duplicateOf = null }) }
+
+/**
+ * 线路更正：只回填还没确认的段落；已确认的照旧不动。
+ * 更正只改线路那份的原话，口译位的确认结果、补译、上屏标记都不受影响。
+ */
+export function correctCue(id: string, text: string): boolean {
+  let applied = false
+  const trimmed = text.trim()
+  if (!trimmed) return false
+  commit(state => {
+    const cue = state.cues.find(item => item.id === id)
+    if (!cue || cue.status === 'confirmed') return
+    cue.text = trimmed
+    cue.corrected = true
+    cue.tags = detectTerms(trimmed, state.terms)
+    const duplicate = findDuplicate(trimmed, state.cues.filter(item => item.id !== id && item.enabled && item.delivery === 'live'))
+    cue.duplicateOf = duplicate?.id || null
+    applied = true
+  })
+  return applied
+}
+
+/** 线路侧挂/摘自己的已上屏段号；对账结论作废后重新回到未对账 */
+export function toggleLineOnScreen(id: string) {
+  commit(state => {
+    const cue = state.cues.find(item => item.id === id)
+    if (!cue) return
+    cue.lineOnScreen = !cue.lineOnScreen
+    cue.reconcile = 'none'
+    cue.resolveNote = ''
+  })
+}
+/** 口译位侧挂/摘自己的已上屏段号 */
+export function toggleDeskOnScreen(id: string) {
+  commit(state => {
+    const cue = state.cues.find(item => item.id === id)
+    if (!cue) return
+    cue.deskOnScreen = !cue.deskOnScreen
+    cue.reconcile = 'none'
+    cue.resolveNote = ''
+  })
+}
+
+/** 旧条目（或任意条目）启用/停用切换 */
+export function setCueEnabled(id: string, enabled: boolean) {
+  commit(state => { const cue = state.cues.find(item => item.id === id); if (cue) cue.enabled = enabled })
+}
+
+/* ---------------- 收工对账 ---------------- */
+
+export interface ReconcileResult {
+  matched: Cue[]
+  mismatched: Cue[]
+}
+
+/**
+ * 两边挂的已上屏段号收工前对账：
+ * 两边一致（都挂或都没挂）= 对得上；不一致的先留出（挂起），等值班主管定。
+ */
+export function reconcileOnScreen(): ReconcileResult {
+  const matched: Cue[] = []
+  const mismatched: Cue[] = []
+  commit(state => {
+    state.cues
+      .filter(cue => cue.enabled)
+      .sort((a, b) => a.seq - b.seq)
+      .forEach(cue => {
+        if (cue.reconcile === 'resolvedLine' || cue.reconcile === 'resolvedDesk') {
+          matched.push(cue)
+          return
+        }
+        if (cue.lineOnScreen !== cue.deskOnScreen) {
+          cue.reconcile = 'held'
+          cue.status = 'quarantined'
+          mismatched.push(cue)
+        } else {
+          if (cue.reconcile === 'held') cue.reconcile = 'none'
+          if (cue.status === 'quarantined' && cue.lineOnScreen && cue.deskOnScreen) cue.status = 'confirmed'
+          matched.push(cue)
+        }
+      })
+  })
+  return { matched, mismatched }
+}
+
+/** 值班主管定夺：以转写线路或口译位那份为准，统一两边的已上屏段号 */
+export function resolveReconcile(id: string, winner: 'line' | 'desk', note: string) {
+  commit(state => {
+    const cue = state.cues.find(item => item.id === id)
+    if (!cue) return
+    const onScreen = winner === 'line' ? cue.lineOnScreen : cue.deskOnScreen
+    cue.lineOnScreen = onScreen
+    cue.deskOnScreen = onScreen
+    cue.reconcile = winner === 'line' ? 'resolvedLine' : 'resolvedDesk'
+    cue.resolveNote = note.trim()
+    cue.status = onScreen ? 'confirmed' : 'pending'
+  })
+}
+
 export function sendReminder(termId: string, cueId: string) {
   commit(state => {
     const exists = state.reminders.some(item => item.termId === termId && item.cueId === cueId)
